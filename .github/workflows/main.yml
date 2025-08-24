@@ -2,7 +2,7 @@ name: Weekly Sentinel-2 Change Detection (New Brunswick)
 
 on:
   schedule:
-    - cron: "0 15 * * 1"
+    - cron: "0 15 * * 1"   # Mondays 15:00 UTC
   workflow_dispatch: {}
 
 permissions:
@@ -36,15 +36,14 @@ jobs:
             pillow
 
       - name: Prepare output folders
-        run: mkdir -p outputs tmp
+        run: mkdir -p outputs tmp docs
 
-      - name: Run Sentinel-2 change detection
+      - name: Run Sentinel-2 change detection (COG)
         shell: bash
         run: |
           python <<'PY'
           import os, glob, datetime, warnings
           import numpy as np
-          import xarray as xr
           import rasterio as rio
           from rasterio.enums import Resampling
           from shapely.geometry import box, mapping
@@ -54,14 +53,16 @@ jobs:
 
           warnings.filterwarnings("ignore")
 
-          BBOX = (-69.2, 44.5, -63.6, 48.2)
+          # ---- Config ----
+          BBOX = (-69.2, 44.5, -63.6, 48.2)  # approx NB extent
           CLOUD_PCT = 30
           RES_M = 60
           LOOKBACK_DAYS = 14
           OUTDIR = "outputs"
 
-          today = datetime.date.today()
-          start = (today - datetime.timedelta(days=LOOKBACK_DAYS)).isoformat()
+          import datetime as dt
+          today = dt.date.today()
+          start = (today - dt.timedelta(days=LOOKBACK_DAYS)).isoformat()
           end = today.isoformat()
 
           stac = Client.open("https://earth-search.aws.element84.com/v1")
@@ -75,19 +76,21 @@ jobs:
           )
           items = list(search.get_items())
           if not items:
-              raise RuntimeError("No Sentinel-2 L2A items found.")
+              raise RuntimeError("No Sentinel-2 L2A items found for the time window/filters.")
 
-          # Group by date
+          # group by date
           from collections import defaultdict
           by_date = defaultdict(list)
           for it in items:
-              d = it.properties["datetime"][:10]
+              d = it.properties["datetime"][:10]  # YYYY-MM-DD
               by_date[d].append(it)
 
           dates = sorted(by_date.keys())
           picked_date = dates[-1]
           picked_items = by_date[picked_date]
+          print(f"Using acquisition date: {picked_date} with {len(picked_items)} scenes.")
 
+          # Build stack
           assets = ["B04", "B08"]
           da = stackstac.stack(
               picked_items,
@@ -104,14 +107,13 @@ jobs:
           red = mosaic.sel(band="B04")
           nir = mosaic.sel(band="B08")
 
+          # NDVI
           ndvi = (nir - red) / (nir + red + 1e-6)
           ndvi = ndvi.clip(-1, 1)
           ndvi = ndvi.rio.write_crs(da.rio.crs)
           ndvi = ndvi.rio.write_transform(da.rio.transform())
 
           ndvi_cog = os.path.join(OUTDIR, f"nb_ndvi_{picked_date}.tif")
-
-          # Save as Cloud Optimized GeoTIFF
           ndvi.rio.to_raster(
               ndvi_cog,
               driver="COG",
@@ -123,46 +125,218 @@ jobs:
 
           # Quicklook PNG
           def save_png(data_xr, path):
-              arr = data_xr.compute().values
-              scaled = ((arr + 1) / 2 * 255).astype(np.uint8)
+              a = data_xr.compute().values
+              scaled = ((a + 1) / 2 * 255).astype(np.uint8)  # [-1,1] -> [0,255]
               Image.fromarray(scaled).save(path)
 
-          ndvi_png = os.path.join(OUTDIR, f"nb_ndvi_{picked_date}.png")
-          save_png(ndvi, ndvi_png)
+          save_png(ndvi, os.path.join(OUTDIR, f"nb_ndvi_{picked_date}.png"))
 
-          # Change detection if previous NDVI exists
-          prev_files = sorted(glob.glob(os.path.join(OUTDIR, "nb_ndvi_*.tif")))
-          prev_files = [f for f in prev_files if picked_date not in f]
+          # Change vs previous (if any)
+          prev = sorted(glob.glob(os.path.join(OUTDIR, "nb_ndvi_*.tif")))
+          prev = [p for p in prev if picked_date not in p]
 
-          if prev_files:
-              prev_path = prev_files[-1]
+          if prev:
+              prev_path = prev[-1]
               with rio.open(prev_path) as src_prev, rio.open(ndvi_cog) as src_cur:
-                  prev = src_prev.read(1, out_shape=(1, src_cur.height, src_cur.width), resampling=Resampling.bilinear)
-                  cur = src_cur.read(1)
-                  d = np.clip(cur - prev, -2.0, 2.0)
+                  prev_arr = src_prev.read(1, out_shape=(1, src_cur.height, src_cur.width), resampling=Resampling.bilinear)
+                  cur_arr  = src_cur.read(1)
+                  d = np.clip(cur_arr - prev_arr, -2.0, 2.0).astype(np.float32)
 
                   change_cog = os.path.join(OUTDIR, f"nb_ndvi_change_{picked_date}.tif")
                   profile = src_cur.profile.copy()
                   profile.update(driver="COG", compress="LZW", dtype="float32", BLOCKSIZE=512, OVERVIEWS="AUTO")
-
                   with rio.open(change_cog, "w", **profile) as dst:
-                      dst.write(d.astype(np.float32), 1)
+                      dst.write(d, 1)
 
-                  change_png = os.path.join(OUTDIR, f"nb_ndvi_change_{picked_date}.png")
+                  # Quicklook for change
                   lo, hi = -0.5, 0.5
-                  scaled = np.clip((d - lo) / (hi - lo), 0, 1) * 255
-                  Image.fromarray(scaled.astype(np.uint8)).save(change_png)
+                  scaled = np.clip((d - lo) / (hi - lo), 0, 1) * 255.0
+                  Image.fromarray(scaled.astype(np.uint8)).save(os.path.join(OUTDIR, f"nb_ndvi_change_{picked_date}.png"))
+
+          # Write a tiny manifest for the viewer
+          # (points the viewer at the newest NDVI and optional change file)
+          latest = {
+            "ndvi_cog": f"nb_ndvi_{picked_date}.tif",
+            "ndvi_png": f"nb_ndvi_{picked_date}.png"
+          }
+          change_candidates = sorted(glob.glob(os.path.join(OUTDIR, f"nb_ndvi_change_{picked_date}.tif")))
+          if change_candidates:
+              latest["change_cog"] = os.path.basename(change_candidates[-1])
+              latest["change_png"] = latest["change_cog"].replace(".tif", ".png")
+
+          import json
+          with open(os.path.join(OUTDIR, "latest.json"), "w") as f:
+              json.dump(latest, f, indent=2)
           PY
 
-      - name: Commit COGs and PNGs
+      - name: Build simple Leaflet viewer (docs/index.html) and copy latest files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/assets
+
+          # Pick latest NDVI / Change (if exist)
+          NDVI_TIF=$(ls -1 outputs/nb_ndvi_*.tif | tail -n 1)
+          NDVI_PNG="${NDVI_TIF%.tif}.png"
+          CHANGE_TIF=$(ls -1 outputs/nb_ndvi_change_*.tif 2>/dev/null | tail -n 1 || true)
+          CHANGE_PNG=""
+          if [ -n "${CHANGE_TIF}" ]; then
+            CHANGE_PNG="${CHANGE_TIF%.tif}.png"
+          fi
+
+          # Copy "latest" into docs for Pages hosting
+          cp "$NDVI_TIF" "docs/$(basename "$NDVI_TIF")"
+          cp "$NDVI_PNG" "docs/$(basename "$NDVI_PNG")"
+          if [ -n "${CHANGE_TIF}" ]; then cp "$CHANGE_TIF" "docs/$(basename "$CHANGE_TIF")"; fi
+          if [ -n "${CHANGE_PNG}" ]; then cp "$CHANGE_PNG" "docs/$(basename "$CHANGE_PNG")"; fi
+          cp outputs/latest.json docs/latest.json
+
+          # Write the Leaflet viewer
+          cat > docs/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1" />
+            <title>NB Sentinel-2 NDVI & Change (Latest)</title>
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+            <style>
+              html, body, #map { height: 100%; margin: 0; }
+              .legend {
+                position: absolute; bottom: 12px; left: 12px; background: rgba(255,255,255,0.9);
+                padding: 8px 10px; border-radius: 8px; font: 12px/1.2 system-ui, sans-serif;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+              }
+              .panel {
+                position: absolute; top: 12px; left: 12px; background: rgba(255,255,255,0.95);
+                padding: 10px 12px; border-radius: 10px; max-width: 360px; font: 14px/1.3 system-ui, sans-serif;
+                box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+              }
+              .panel h1 { font-size: 16px; margin: 0 0 6px; }
+              .panel small { color: #555; }
+            </style>
+          </head>
+          <body>
+            <div id="map"></div>
+            <div class="panel">
+              <h1>New Brunswick – Sentinel-2 NDVI (latest)</h1>
+              <div id="meta"><small>Loading latest metadata…</small></div>
+            </div>
+            <div class="legend" id="legend">
+              <div><strong>NDVI</strong> (−1 → 1)</div>
+              <div style="display:flex;align-items:center;gap:6px;margin-top:6px;">
+                <div style="width:180px;height:10px;background:linear-gradient(to right,#7f0000,#d7301f,#fdae61,#ffffbf,#a6d96a,#1a9850,#00441b)"></div>
+              </div>
+              <small>Toggle “Change” in Layers to view ΔNDVI</small>
+            </div>
+
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+            <script src="https://unpkg.com/geotiff@2.1.3/dist-browser/geotiff.min.js"></script>
+            <script src="https://unpkg.com/leaflet-geotiff-2/dist/leaflet-geotiff-2.umd.min.js"></script>
+            <script>
+              // New Brunswick view
+              const map = L.map('map', { zoomControl: true }).setView([46.5, -66.0], 7);
+              L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 19, attribution: '&copy; OpenStreetMap'
+              }).addTo(map);
+
+              // Utility: domain/palette for NDVI and Change
+              const ndviDomain = [-1, 1];
+              const ndviPalette = [
+                "#7f0000","#d7301f","#fdae61","#ffffbf","#a6d96a","#1a9850","#00441b"
+              ];
+              const changeDomain = [-0.4, 0.4]; // ΔNDVI visualization range
+              const changePalette = ["#313695","#74add1","#e0f3f8","#f7f7f7","#fee090","#f46d43","#a50026"];
+
+              // Load latest filenames
+              fetch('latest.json')
+                .then(r => r.json())
+                .then(meta => {
+                  const metaDiv = document.getElementById('meta');
+                  const ndviName = meta.ndvi_cog;
+                  const changeName = meta.change_cog;
+
+                  metaDiv.innerHTML = `
+                    <small>
+                      NDVI: <code>${ndviName || "N/A"}</code><br/>
+                      Change: <code>${changeName || "N/A"}</code>
+                    </small>
+                  `;
+
+                  const layers = {};
+
+                  // NDVI COG
+                  if (ndviName) {
+                    const ndviLayer = L.leafletGeotiff(ndviName, {
+                      band: 0,
+                      renderer: new L.LeafletGeotiff.Plotty({
+                        displayMin: ndviDomain[0],
+                        displayMax: ndviDomain[1],
+                        colorScale: 'viridis' // fallback
+                      }),
+                      image: { noData: NaN }
+                    });
+
+                    // Replace with a custom palette via plotty api:
+                    // leaflet-geotiff-2 exposes plotty; we swap color scale after init
+                    ndviLayer.once('load', () => {
+                      try {
+                        const p = ndviLayer.options.renderer.plotty;
+                        // define custom ramp
+                        p.addColorScale('ndviCustom', ndviPalette);
+                        p.setColorScale('ndviCustom');
+                        p.setDomain(ndviDomain[0], ndviDomain[1]);
+                        ndviLayer.redraw();
+                      } catch(e){}
+                    });
+
+                    ndviLayer.addTo(map);
+                    layers["NDVI (latest)"] = ndviLayer;
+                  }
+
+                  // Change COG
+                  if (changeName) {
+                    const changeLayer = L.leafletGeotiff(changeName, {
+                      band: 0,
+                      renderer: new L.LeafletGeotiff.Plotty({
+                        displayMin: changeDomain[0],
+                        displayMax: changeDomain[1],
+                        colorScale: 'balance' // diverging fallback
+                      }),
+                      image: { noData: NaN }
+                    });
+                    changeLayer.once('load', () => {
+                      try {
+                        const p = changeLayer.options.renderer.plotty;
+                        p.addColorScale('changeCustom', changePalette);
+                        p.setColorScale('changeCustom');
+                        p.setDomain(changeDomain[0], changeDomain[1]);
+                        changeLayer.redraw();
+                      } catch(e){}
+                    });
+                    layers["ΔNDVI (change)"] = changeLayer;
+                  }
+
+                  L.control.layers({}, layers, { collapsed: false }).addTo(map);
+                })
+                .catch(err => {
+                  document.getElementById('meta').innerHTML = `<small style="color:#a00">Failed to load latest.json</small>`;
+                  console.error(err);
+                });
+            </script>
+          </body>
+          </html>
+          HTML
+
+      - name: Commit outputs and viewer
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add outputs/*
+          git add outputs/* docs/*
           if git diff --cached --quiet; then
             echo "No new results to commit."
           else
-            git commit -m "Weekly Sentinel-2 COG NDVI & change for NB ($(date -u +%F))"
+            git commit -m "Weekly Sentinel-2 COG + viewer update ($(date -u +%F))"
             git push
           fi
           
