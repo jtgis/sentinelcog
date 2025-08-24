@@ -3,7 +3,7 @@ name: Weekly Sentinel-2 Change Detection (New Brunswick)
 on:
   schedule:
     - cron: "0 15 * * 1"   # Mondays 15:00 UTC
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -11,7 +11,6 @@ permissions:
 jobs:
   s2_change_detection:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,10 +37,10 @@ jobs:
       - name: Prepare folders
         run: mkdir -p outputs tmp docs
 
-      - name: Run Sentinel-2 change detection (COG, robust search)
+      - name: Write change-detection script
         shell: bash
         run: |
-          python <<'PY'
+          cat > s2_change.py <<'PY'
 import os, glob, json, warnings
 import datetime as dt
 import numpy as np
@@ -90,7 +89,7 @@ if not items:
     print("No Sentinel-2 items found even after widening search (up to 60 days, 100% clouds).")
     os.makedirs("docs", exist_ok=True)
     with open(os.path.join("docs", "index.html"), "w") as f:
-        f.write("<!doctype html><meta charset='utf-8'><body style='font-family:system-ui;margin:2rem'><h1>No new Sentinel-2 data found yet</h1><p>Try again next run.</p>")
+        f.write("<!doctype html><meta charset='utf-8'><body style='font-family:system-ui;margin:2rem'><h1>No new Sentinel-2 data yet</h1><p>Try again next run.</p>")
     with open(os.path.join("docs", "latest.json"), "w") as f:
         json.dump({"ndvi_cog": None, "change_cog": None}, f)
     raise SystemExit(0)
@@ -114,8 +113,7 @@ da = stackstac.stack(
     assets=assets,
     resolution=RES_M,
     bounds=BBOX,
-    # Correct param for this stackstac version
-    chunksize={"time": 1, "x": 1024, "y": 1024},
+    chunksize={"time": 1, "x": 1024, "y": 1024},  # <- correct for this stackstac version
     dtype="uint16"
 )
 
@@ -136,8 +134,8 @@ ndvi.rio.to_raster(
     driver="COG",
     compress="LZW",
     dtype="float32",
-    BLOCKSIZE=512,
-    OVERVIEWS="AUTO"
+    blocksize=512,
+    OVERVIEWS="AUTO"  # rasterio COG driver accepts upper/lower; keep AUTO
 )
 
 def save_png(data_xr, path):
@@ -160,7 +158,7 @@ if prev:
 
         change_cog_path = os.path.join(OUTDIR, f"nb_ndvi_change_{picked_date}.tif")
         profile = src_cur.profile.copy()
-        profile.update(driver="COG", compress="LZW", dtype="float32", BLOCKSIZE=512, OVERVIEWS="AUTO")
+        profile.update(driver="COG", compress="LZW", dtype="float32", blocksize=512, OVERVIEWS="AUTO")
         with rio.open(change_cog_path, "w", **profile) as dst:
             dst.write(d, 1)
 
@@ -185,13 +183,15 @@ with open(os.path.join(OUTDIR, "latest.json"), "w") as f:
     json.dump(latest, f, indent=2)
 PY
 
+      - name: Run change-detection script
+        run: python s2_change.py
+
       - name: Build simple Leaflet viewer (docs/index.html) and copy latest files
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p docs/assets
 
-          # If no outputs yet (graceful skip), keep placeholder written by the Python step
           if ! ls outputs/nb_ndvi_*.tif >/dev/null 2>&1; then
             echo "No NDVI outputs to publish this run."
             exit 0
@@ -212,133 +212,133 @@ PY
           cp outputs/latest.json docs/latest.json
 
           cat > docs/index.html <<'HTML'
-          <!doctype html>
-          <html lang="en">
-          <head>
-            <meta charset="utf-8" />
-            <meta name="viewport" content="width=device-width, initial-scale=1" />
-            <title>NB Sentinel-2 NDVI & Change (Latest)</title>
-            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-            <style>
-              html, body, #map { height: 100%; margin: 0; }
-              .legend {
-                position: absolute; bottom: 12px; left: 12px; background: rgba(255,255,255,0.9);
-                padding: 8px 10px; border-radius: 8px; font: 12px/1.2 system-ui, sans-serif;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.12);
-              }
-              .panel {
-                position: absolute; top: 12px; left: 12px; background: rgba(255,255,255,0.95);
-                padding: 10px 12px; border-radius: 10px; max-width: 360px; font: 14px/1.3 system-ui, sans-serif;
-                box-shadow: 0 2px 12px rgba(0,0,0,0.15);
-              }
-              .panel h1 { font-size: 16px; margin: 0 0 6px; }
-              .panel small { color: #555; }
-            </style>
-          </head>
-          <body>
-            <div id="map"></div>
-            <div class="panel">
-              <h1>New Brunswick – Sentinel-2 NDVI (latest)</h1>
-              <div id="meta"><small>Loading latest metadata…</small></div>
-            </div>
-            <div class="legend" id="legend">
-              <div><strong>NDVI</strong> (−1 → 1)</div>
-              <div style="display:flex;align-items:center;gap:6px;margin-top:6px;">
-                <div style="width:180px;height:10px;background:linear-gradient(to right,#7f0000,#d7301f,#fdae61,#ffffbf,#a6d96a,#1a9850,#00441b)"></div>
-              </div>
-              <small>Toggle “Change” in Layers to view ΔNDVI</small>
-            </div>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NB Sentinel-2 NDVI & Change (Latest)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .legend {
+      position: absolute; bottom: 12px; left: 12px; background: rgba(255,255,255,0.9);
+      padding: 8px 10px; border-radius: 8px; font: 12px/1.2 system-ui, sans-serif;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+    }
+    .panel {
+      position: absolute; top: 12px; left: 12px; background: rgba(255,255,255,0.95);
+      padding: 10px 12px; border-radius: 10px; max-width: 360px; font: 14px/1.3 system-ui, sans-serif;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.15);
+    }
+    .panel h1 { font-size: 16px; margin: 0 0 6px; }
+    .panel small { color: #555; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel">
+    <h1>New Brunswick – Sentinel-2 NDVI (latest)</h1>
+    <div id="meta"><small>Loading latest metadata…</small></div>
+  </div>
+  <div class="legend" id="legend">
+    <div><strong>NDVI</strong> (−1 → 1)</div>
+    <div style="display:flex;align-items:center;gap:6px;margin-top:6px;">
+      <div style="width:180px;height:10px;background:linear-gradient(to right,#7f0000,#d7301f,#fdae61,#ffffbf,#a6d96a,#1a9850,#00441b)"></div>
+    </div>
+    <small>Toggle “Change” in Layers to view ΔNDVI</small>
+  </div>
 
-            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-            <script src="https://unpkg.com/geotiff@2.1.3/dist-browser/geotiff.min.js"></script>
-            <script src="https://unpkg.com/leaflet-geotiff-2/dist/leaflet-geotiff-2.umd.min.js"></script>
-            <script>
-              const map = L.map('map', { zoomControl: true }).setView([46.5, -66.0], 7);
-              L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                maxZoom: 19, attribution: '&copy; OpenStreetMap'
-              }).addTo(map);
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/geotiff@2.1.3/dist-browser/geotiff.min.js"></script>
+  <script src="https://unpkg.com/leaflet-geotiff-2/dist/leaflet-geotiff-2.umd.min.js"></script>
+  <script>
+    const map = L.map('map', { zoomControl: true }).setView([46.5, -66.0], 7);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap'
+    }).addTo(map);
 
-              const ndviDomain = [-1, 1];
-              const ndviPalette = ["#7f0000","#d7301f","#fdae61","#ffffbf","#a6d96a","#1a9850","#00441b"];
-              const changeDomain = [-0.4, 0.4];
-              const changePalette = ["#313695","#74add1","#e0f3f8","#f7f7f7","#fee090","#f46d43","#a50026"];
+    const ndviDomain = [-1, 1];
+    const ndviPalette = ["#7f0000","#d7301f","#fdae61","#ffffbf","#a6d96a","#1a9850","#00441b"];
+    const changeDomain = [-0.4, 0.4];
+    const changePalette = ["#313695","#74add1","#e0f3f8","#f7f7f7","#fee090","#f46d43","#a50026"];
 
-              fetch('latest.json')
-                .then(r => r.json())
-                .then(meta => {
-                  const metaDiv = document.getElementById('meta');
-                  const ndviName = meta.ndvi_cog;
-                  const changeName = meta.change_cog || null;
-                  const info = `
-                    <small>
-                      Collection: <code>${meta.collection || "n/a"}</code> &nbsp;
-                      Window: <code>${meta.lookback_days || "n/a"}d</code> &nbsp;
-                      Cloud&lt;: <code>${meta.cloud_threshold || "n/a"}%</code><br/>
-                      NDVI: <code>${ndviName || "N/A"}</code> &nbsp;
-                      Change: <code>${changeName || "N/A"}</code>
-                    </small>`;
-                  metaDiv.innerHTML = info;
+    fetch('latest.json')
+      .then(r => r.json())
+      .then(meta => {
+        const metaDiv = document.getElementById('meta');
+        const ndviName = meta.ndvi_cog;
+        const changeName = meta.change_cog || null;
+        const info = `
+          <small>
+            Collection: <code>${meta.collection || "n/a"}</code>
+            &nbsp;Window: <code>${meta.lookback_days || "n/a"}d</code>
+            &nbsp;Cloud&lt;: <code>${meta.cloud_threshold || "n/a"}%</code><br/>
+            NDVI: <code>${ndviName || "N/A"}</code>
+            &nbsp;Change: <code>${changeName || "N/A"}</code>
+          </small>`;
+        metaDiv.innerHTML = info;
 
-                  const layers = {};
-                  if (ndviName) {
-                    const ndviLayer = L.leafletGeotiff(ndviName, {
-                      band: 0,
-                      renderer: new L.LeafletGeotiff.Plotty({
-                        displayMin: ndviDomain[0],
-                        displayMax: ndviDomain[1],
-                        colorScale: 'viridis'
-                      }),
-                      image: { noData: NaN }
-                    });
-                    ndviLayer.once('load', () => {
-                      try {
-                        const p = ndviLayer.options.renderer.plotty;
-                        p.addColorScale('ndviCustom', ndviPalette);
-                        p.setColorScale('ndviCustom');
-                        p.setDomain(ndviDomain[0], ndviDomain[1]);
-                        ndviLayer.redraw();
-                      } catch(e){}
-                    });
-                    ndviLayer.addTo(map);
-                    layers["NDVI (latest)"] = ndviLayer;
-                  }
-                  if (changeName) {
-                    const changeLayer = L.leafletGeotiff(changeName, {
-                      band: 0,
-                      renderer: new L.LeafletGeotiff.Plotty({
-                        displayMin: changeDomain[0],
-                        displayMax: changeDomain[1],
-                        colorScale: 'balance'
-                      }),
-                      image: { noData: NaN }
-                    });
-                    changeLayer.once('load', () => {
-                      try {
-                        const p = changeLayer.options.renderer.plotty;
-                        p.addColorScale('changeCustom', changePalette);
-                        p.setColorScale('changeCustom');
-                        p.setDomain(changeDomain[0], changeDomain[1]);
-                        changeLayer.redraw();
-                      } catch(e){}
-                    });
-                    layers["ΔNDVI (change)"] = changeLayer;
-                  }
-                  L.control.layers({}, layers, { collapsed: false }).addTo(map);
-                })
-                .catch(err => {
-                  document.getElementById('meta').innerHTML = `<small style="color:#a00">No latest.json yet.</small>`;
-                  console.error(err);
-                });
-            </script>
-          </body>
-          </html>
+        const layers = {};
+        if (ndviName) {
+          const ndviLayer = L.leafletGeotiff(ndviName, {
+            band: 0,
+            renderer: new L.LeafletGeotiff.Plotty({
+              displayMin: ndviDomain[0],
+              displayMax: ndviDomain[1],
+              colorScale: 'viridis'
+            }),
+            image: { noData: NaN }
+          });
+          ndviLayer.once('load', () => {
+            try {
+              const p = ndviLayer.options.renderer.plotty;
+              p.addColorScale('ndviCustom', ndviPalette);
+              p.setColorScale('ndviCustom');
+              p.setDomain(ndviDomain[0], ndviDomain[1]);
+              ndviLayer.redraw();
+            } catch(e){}
+          });
+          ndviLayer.addTo(map);
+          layers["NDVI (latest)"] = ndviLayer;
+        }
+        if (changeName) {
+          const changeLayer = L.leafletGeotiff(changeName, {
+            band: 0,
+            renderer: new L.LeafletGeotiff.Plotty({
+              displayMin: changeDomain[0],
+              displayMax: changeDomain[1],
+              colorScale: 'balance'
+            }),
+            image: { noData: NaN }
+          });
+          changeLayer.once('load', () => {
+            try {
+              const p = changeLayer.options.renderer.plotty;
+              p.addColorScale('changeCustom', changePalette);
+              p.setColorScale('changeCustom');
+              p.setDomain(changeDomain[0], changeDomain[1]);
+              changeLayer.redraw();
+            } catch(e){}
+          });
+          layers["ΔNDVI (change)"] = changeLayer;
+        }
+        L.control.layers({}, layers, { collapsed: false }).addTo(map);
+      })
+      .catch(err => {
+        document.getElementById('meta').innerHTML = `<small style="color:#a00">No latest.json yet.</small>`;
+        console.error(err);
+      });
+  </script>
+</body>
+</html>
 HTML
 
       - name: Commit outputs and viewer
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add outputs/* docs/*
+          git add outputs/* docs/* s2_change.py || true
           if git diff --cached --quiet; then
             echo "No new results to commit."
           else
