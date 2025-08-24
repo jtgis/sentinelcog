@@ -3,7 +3,7 @@ name: Weekly Sentinel-2 Change Detection (New Brunswick)
 on:
   schedule:
     - cron: "0 15 * * 1"   # Mondays 15:00 UTC
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: write
